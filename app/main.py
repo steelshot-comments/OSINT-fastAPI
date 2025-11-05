@@ -128,4 +128,5 @@ async def transform_updates(websocket: WebSocket, node_id: str):
         await asyncio.to_thread(pubsub.unsubscribe, "transform_updates")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -7,3 +7,7 @@ celery
 redis
 requests
 python-multipart
+shutil
+asyncio
+json
+sqlite3
