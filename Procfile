@@ -1,2 +1,1 @@
-web: gunicorn -k uvicorn.workers.UvicornWorker app.main:app
-worker: celery -A app.core.celery_app.celery_app worker --loglevel=info
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
