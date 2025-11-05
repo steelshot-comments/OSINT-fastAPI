@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-gunicorn
+aiofiles
 neo4j
 pydantic
 celery
 redis
 requests
+python-multipart

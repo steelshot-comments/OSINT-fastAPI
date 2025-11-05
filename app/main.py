@@ -5,8 +5,8 @@ from fastapi import FastAPI,WebSocket, WebSocketDisconnect, UploadFile, File, HT
 from fastapi.responses import JSONResponse
 from celery.result import AsyncResult
 from pydantic import BaseModel
-from worker import run_tool, celery
-from redis_config import redis_client
+from celery import Celery
+from app.redis_config import redis_client
 import sqlite3
 import json
 import asyncio
@@ -15,6 +15,8 @@ import uvicorn
 active_connections = {}
 
 app = FastAPI()
+
+celery = Celery("osint_tasks", broker=os.getenv("REDIS_URL"))
 
 class RunRequest(BaseModel):
     query: str
@@ -80,12 +82,12 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/run/{source_name}")
 def run_osint_task(source_name: str, req: RunRequest):
-    task = run_tool.delay(source_name, req.query, req.node_id)
+    task = celery.send_task("worker.run_tool", args=[source_name, req.query, req.node_id])
     return {"task_id": task.id}
 
 @app.get("/task-result/{task_id}")
 def get_task_result(task_id: str):
-    task_result = AsyncResult(task_id, app=celery)
+    task_result = celery.AsyncResult(task_id)
     if task_result.ready():
         return {"status": "SUCCESS", "result": task_result.result}
     return {"status": "pending"}
