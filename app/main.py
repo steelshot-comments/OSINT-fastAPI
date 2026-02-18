@@ -1,22 +1,28 @@
 import os
 import shutil
 import time
-from fastapi import FastAPI,WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi import FastAPI,WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from celery.result import AsyncResult
 from pydantic import BaseModel
 from celery import Celery
-from app.redis_config import redis_client
+from redis_config import redis_client, redis_url
 import sqlite3
 import json
 import asyncio
 import uvicorn
+import logging
+from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
 
 active_connections = {}
 
 app = FastAPI()
 
-celery = Celery("osint_tasks", broker=os.getenv("REDIS_URL"))
+celery = Celery("osint_tasks", broker=redis_url)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class RunRequest(BaseModel):
     query: str
@@ -41,27 +47,56 @@ def fetch_results():
         })
     return results
 
-# Create root endpoint
-@app.get("/")
-def read_root():
-    # explain the routes
-    return {
-        "message": "Welcome to the OSINT Data Ingestion API!",
-        "routes": {
-            "/run/{source_name}/{query}": "Run an OSINT task with the specified source and query.",
-            "/result/{task_id}": "Get the result of a task by its ID.",
-            "/results": "Fetch all results from the database.",
-            "/ws/transforms/{node_id}": "WebSocket endpoint for transform updates.",
-            "/action-map": "ahhaha"
-        }
-    }
+@app.middleware("http")
+async def wrap_success_responses(request: Request, call_next):
+    body = await request.body()
+    print("📥 Raw body:", body)
+    print("📋 Headers:", request.headers)
+    try:
+        response = await call_next(request)
+
+        # Skip wrapping errors or already-JSON responses
+        if response.status_code >= 400:
+            return response
+
+        # Only wrap JSON responses
+        if hasattr(response, "media_type") and response.media_type == "application/json":
+            body = b"".join([chunk async for chunk in response.body_iterator])
+            response.body_iterator = iter([body])
+            try:
+                import json
+                data = json.loads(body)
+            except Exception:
+                data = body.decode()
+
+            # If already has 'success', leave it
+            if isinstance(data, dict) and "success" in data:
+                return response
+
+            message = "Success"
+            if isinstance(data, dict) and "message" in data:
+                message = data.pop("message")
+
+            # Wrap into standard format
+            wrapped = {
+                "success": True,
+                "message": message,
+                "data": data,
+            }
+            finalResponse = JSONResponse(content=wrapped, status_code=response.status_code)
+            print("📥 Response:", finalResponse)
+            return finalResponse
+        return response
+    except Exception as e:
+        # Let global handler deal with unhandled errors
+        raise e
 
 @app.get("/action-map")
 def get_action_map():
     with open("action_map.json") as f:
         action_map = json.load(f)
 
-    return JSONResponse(content=action_map)
+    return {'message': action_map}
 
 @app.post("/upload-file")
 async def upload_file(file: UploadFile = File(...)):
@@ -70,7 +105,7 @@ async def upload_file(file: UploadFile = File(...)):
         filename = f"{file.filename}"
         filepath = os.path.join('file_uploads', filename)
 
-        os.makedirs("file_uploads", exist_ok=True)  # Ensure folder exists
+        os.makedirs("file_uploads", exist_ok=True)
 
         with open(filepath, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -78,7 +113,7 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
 
-    return JSONResponse(content={"message": "File uploaded successfully", "filename": filename})
+    return {"message": "File uploaded successfully", "filename": filename}
 
 @app.post("/run/{source_name}")
 def run_osint_task(source_name: str, req: RunRequest):
@@ -126,6 +161,28 @@ async def transform_updates(websocket: WebSocket, node_id: str):
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         await asyncio.to_thread(pubsub.unsubscribe, "transform_updates")
+
+@app.exception_handler(Exception)
+def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error: {exc}")
+    return JSONResponse(
+        status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "success": False,
+            "message": "There is a problem with our servers. Please try again later.",
+            "code": "SERVER_ERROR"
+        },
+    )
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException):
+    # If developer raises HTTPException(detail=...)
+    if isinstance(exc.detail, dict):
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "message": str(exc.detail)},
+    )
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
